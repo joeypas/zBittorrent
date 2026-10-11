@@ -5,21 +5,70 @@ const ArrayList = std.ArrayList;
 const StringHashMap = std.StringHashMap;
 const Allocator = std.mem.Allocator;
 const Reader = std.Io.Reader;
+const Writer = std.Io.Writer;
 
 pub const FileInfo = struct {
     path: ArrayList(u8),
     length: usize,
 };
 
+/// All memory owned by the struct and freed on deinit
 pub const MetaInfo = struct {
+    arena: std.heap.ArenaAllocator,
     announce: ArrayList(u8),
     info: struct {
         name: ArrayList(u8),
         private: bool,
         piece_len: usize,
         files: ArrayList(FileInfo),
-        pieces: ArrayList(u8),
+        pieces: []const [20]u8,
     },
+    _val: bencoding.Value,
+
+    pub fn parse(allocator: Allocator, reader: *Reader) !MetaInfo {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const alloc = arena.allocator();
+
+        const val = try bencoding.Value.parse(alloc, reader);
+        const meta_inf = try ensureDict(val);
+
+        const url: ArrayList(u8) = try getKey(meta_inf, "announce", .str);
+
+        const info: StringHashMap(Value) = try getKey(meta_inf, "info", .dictionary);
+
+        const name: ArrayList(u8) = try getKey(info, "name", .str);
+        const piece_len: usize = @intCast(try getKey(info, "piece length", .int));
+
+        const _private: i64 = try getKey(info, "private", .int);
+        const private = _private == 1;
+
+        const pieces: ArrayList(u8) = try getKey(info, "pieces", .str);
+        if (pieces.items.len % 20 != 0) return error.InvalidPieces;
+
+        const files = try parseFiles(alloc, info);
+
+        return .{
+            .arena = arena,
+            .announce = url,
+            .info = .{
+                .name = name,
+                .private = private,
+                .pieces = try parsePieceHashes(pieces.items),
+                .piece_len = piece_len,
+                .files = files,
+            },
+            ._val = val,
+        };
+    }
+
+    pub fn deinit(self: *@This()) void {
+        self.arena.deinit();
+    }
+
+    pub fn bencode(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        try self._val.format(writer);
+    }
 
     pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
         try writer.print("announce: {s}\n", .{self.announce.items});
@@ -29,7 +78,6 @@ pub const MetaInfo = struct {
         try writer.print("  files_len: {d}\n", .{self.info.files.items.len});
         try writer.print("  piece_len: {d}\n]", .{self.info.piece_len});
     }
-
 };
 
 fn ensureDict(val: Value) !StringHashMap(Value) {
@@ -56,20 +104,35 @@ fn ensureStr(val: Value) !ArrayList(u8) {
     };
 }
 
+fn validatePathComponent(component: []const u8) !void {
+    if (component.len == 0)
+        return error.InvalidPath;
+
+    if (std.mem.eql(u8, component, ".") or
+        std.mem.eql(u8, component, ".."))
+        return error.InvalidPath;
+
+    for (component) |c| {
+        if (c == 0 or c == '/' or c == '\\' or c == ':')
+            return error.InvalidPath;
+    }
+}
+
 fn joinPath(alloc: Allocator, list: ArrayList(Value)) !ArrayList(u8) {
     var path: ArrayList(u8) = .empty;
+    errdefer path.deinit(alloc);
 
-    for (list.items) |item| {
+    for (list.items, 0..) |item, i| {
         const sub_path = try ensureStr(item);
+        try validatePathComponent(sub_path.items);
+
+        if (i != 0) try path.append(alloc, std.fs.path.sep);
         try path.appendSlice(alloc, sub_path.items);
-        try path.append(alloc, '/');
     }
-    _ = path.pop();
     return path;
 }
 
 fn parseFiles(alloc: Allocator, info: StringHashMap(Value)) !ArrayList(FileInfo) {
-
     var files: ArrayList(FileInfo) = .empty;
     if (info.getKey("length")) |_| {
         var fi = try files.addOne(alloc);
@@ -78,47 +141,23 @@ fn parseFiles(alloc: Allocator, info: StringHashMap(Value)) !ArrayList(FileInfo)
     } else {
         const files_list: ArrayList(Value) = try getKey(info, "files", .list);
         for (files_list.items) |entry| {
-            const file_info = try ensureDict(entry); 
+            const file_info = try ensureDict(entry);
             var fi = try files.addOne(alloc);
-            fi.path = try joinPath(alloc,try getKey(file_info, "path", .list));
+            fi.path = try joinPath(alloc, try getKey(file_info, "path", .list));
             fi.length = @intCast(try getKey(file_info, "length", .int));
         }
     }
     return files;
 }
 
-pub fn parseMetaInfo(alloc: Allocator, reader: *Reader) !MetaInfo {
-    const meta_inf = try ensureDict(try bencoding.parseValue(alloc, reader));
+fn parsePieceHashes(pieces: []const u8) ![]const [20]u8 {
+    if (pieces.len % 20 != 0) return error.InvalidPieces;
 
-    const url: ArrayList(u8) = try getKey(meta_inf, "announce", .str);
-
-    const info: StringHashMap(Value) = try getKey(meta_inf, "info", .dictionary);
-
-    const name: ArrayList(u8) = try getKey(info, "name", .str);
-    const piece_len: usize = @intCast(try getKey(info, "piece length", .int));
-
-    const _private: i64 = try getKey(info, "private", .int);
-    const private = _private == 1;
-
-    const pieces: ArrayList(u8) = try getKey(info, "pieces", .str);
-
-    const files = try parseFiles(alloc, info);
-
-    return .{
-        .announce = url,
-        .info = .{
-            .name = name,
-            .private = private,
-            .pieces = pieces,
-            .piece_len = piece_len,
-            .files = files,
-        }
-    };
+    return std.mem.bytesAsSlice([20]u8, pieces);
 }
 
 test "metainf" {
     const alloc = std.testing.allocator;
-    var arena: std.heap.ArenaAllocator = .init(alloc);
     var file = try std.Io.Dir.openFile(std.Io.Dir.cwd(), std.testing.io, "test_folder-d984f67af9917b214cd8b6048ab5624c7df6a07a.torrent", .{ .mode = .read_only });
 
     var buf: [1024]u8 = undefined;
@@ -127,9 +166,6 @@ test "metainf" {
     // const str = "d8:announce3:yay4:infoi34ee";
     // var reader = std.Io.Reader.fixed(str);
 
-    const t = try parseMetaInfo(arena.allocator(), &reader.interface);
-
-    std.debug.print("{f}\n", .{t});
-
-    arena.deinit();
+    var t = try MetaInfo.parse(alloc, &reader.interface);
+    defer t.deinit();
 }
